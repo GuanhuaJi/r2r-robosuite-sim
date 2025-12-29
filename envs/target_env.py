@@ -15,7 +15,7 @@ from pathlib import Path
 import imageio.v3 as iio
 
 
-STEP_MAX = 0.02          # Maximum allowed L1 displacement per frame (m), 1 cm
+STEP_MAX = 0.02
 ORI_LERP = False
 
 class TargetEnvWrapper:
@@ -202,4 +202,106 @@ class TargetEnvWrapper:
             print(f"\033[91m[FAILURE] Could not reach target pose for {self.target_name} – episode {episode}\033[0m")
             steps = len(target_pose_list)
             return False, suggestion, steps
+                
+    def generate_one_image(
+        self,
+        eef_pose,
+        gripper_value,
+        save_paired_images_folder_path="paired_images",
+        robot_dataset=None,
+        robot_disp=None,
+        frame_idx: int | None = None,
+        episode: int | None = None,
+    ):
+        """
+        Single-frame version of generate_image.
 
+        Inputs:
+        - eef_pose: (7,) [x,y,z,qx,qy,qz,qw]  (same convention as compute_eef_pose())
+        - gripper_value: target gripper "dist" (the normalized value returned by get_gripper_width_from_qpos()[1])
+        - robot_dataset: used ONLY for choosing the hardcoded camera_pose exactly like the original code
+        - robot_disp: (3,) offset; if None -> zeros
+        - frame_idx: if provided, save as "{frame_idx}.png" and "{frame_idx}_mask.png"
+        - episode: if provided, save under an episode subfolder
+
+        Saves:
+        - RGB PNG and mask PNG under:
+            <save_paired_images_folder_path>/<target_name>_replay_frames[/<episode>]/<frame_idx or random>.png
+            <save_paired_images_folder_path>/<target_name>_replay_masks [/<episode>]/<frame_idx or random>_mask.png
+
+        Returns:
+            (success, rgb, mask)
+            - rgb: (H,W,3) uint8 RGB image (or None if failed)
+            - mask: (H,W) uint8 mask with values {0,255} (or None if failed)
+        """
+        # print(robot_dataset, robot_disp)
+
+        # ---------------- camera pose (HARD-CODED like original) ----------------
+        if robot_dataset == "can":
+            camera_pose = np.array([0.9, 0.1, 1.75, 0.271, 0.271, 0.653, 0.653])
+        elif robot_dataset == "lift":
+            camera_pose = np.array([0.45, 0, 1.35, 0.271, 0.271, 0.653, 0.653])
+        elif robot_dataset == "square":
+            camera_pose = np.array([0.45, 0, 1.35, 0.271, 0.271, 0.653, 0.653])
+        elif robot_dataset == "stack":
+            camera_pose = np.array([0.45, 0, 1.35, 0.271, 0.271, 0.653, 0.653])
+        elif robot_dataset == "three_piece_assembly":
+            camera_pose = np.array(
+                [
+                    0.713078462147161,
+                    2.062036796036723e-08,
+                    1.5194726087166726,
+                    0.293668270111084,
+                    0.2936684489250183,
+                    0.6432408690452576,
+                    0.6432409286499023,
+                ]
+            )
+        else:
+            raise ValueError(
+                f"robot_dataset={robot_dataset!r} is not supported in generate_one_image. "
+                "Expected one of: can, lift, square, stack, three_piece_assembly."
+            )
+
+        if robot_disp is None:
+            robot_disp = np.zeros(3, dtype=np.float32)
+
+        camera_pose[:3] -= robot_disp
+        self.target_env.camera_wrapper.set_camera_pose(pos=camera_pose[:3], quat=camera_pose[3:])
+        self.target_env.update_camera()
+
+        # ---------------- drive gripper to target ----------------
+        _, gripper_dist = self.target_env.get_gripper_width_from_qpos()
+        attempt = 0
+        while (gripper_dist < gripper_value - 0.1 or gripper_dist > gripper_value + 0.1) and attempt < 10:
+            if gripper_dist < gripper_value - 0.1:
+                self.target_env.open_close_gripper(gripper_open=True)
+            elif gripper_dist > gripper_value + 0.1:
+                self.target_env.open_close_gripper(gripper_open=False)
+            _, gripper_dist = self.target_env.get_gripper_width_from_qpos()
+            attempt += 1
+
+        # ---------------- drive robot to target pose ----------------
+        target_pose = np.array(eef_pose, dtype=np.float32).copy()
+        target_pose[:3] -= robot_disp
+
+        target_reached, _target_reached_pose, _error = self.target_env.drive_robot_to_target_pose(
+            target_pose=target_pose
+        )
+
+        if not target_reached:
+                print(f"[91m[FAILURE] Could not reach target pose for {self.target_name}[0m")
+                return False, None, None
+
+        # ---------------- render one frame ----------------
+        target_robot_img, target_robot_seg_img = self.target_env.get_observation_fast(
+            white_background=True,
+            width=self.camera_width,
+            height=self.camera_height,
+        )
+
+        # ---------------- return arrays (no file I/O) ----------------
+        rgb = target_robot_img.astype(np.uint8)
+        mask = (target_robot_seg_img.astype(np.uint8) * 255)
+
+        return True, rgb, mask
